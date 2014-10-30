@@ -1,0 +1,165 @@
+---
+title: "處理 LiDAR 資料轉成表面數值地形圖"
+author: "林政道"
+date: "October 29, 2014"
+output: html_document
+---
+
+## 將 LiDAR 資料轉成 STM 網格 (1)
+
+### 概念及做法
+
+LiDAR 掃出來的資料是「點」資料，若要靠這些反射回來的點座標推得一個區域內的數值地形圖(Digital Terrain Map; DTM，雖然 LiDAR 掃出來的應該是「表面」Surface Terrain Model，若要取得真正的數值地形圖則必須要再做轉換)，直覺上最快的作法就是將每個相同座標的點找最小值。假設我們透過 LiDAR 掃描取得的 xyz 座標為(單位為公尺)：
+
+id | x       | y       | z
+---|---------|---------|---------
+1  | -0.1061 | -0.1624 | 1178.482
+2  | -0.1061 | -0.1623 | 1178.475
+3  | -0.1060 | -0.1623 | 1178.474
+4  | -0.1060 | -0.1624 | 1178.481
+5  | -0.1060 | -0.1623 | 1178.473
+6  | -0.1059 | -0.1623 | 1178.472
+
+示意圖如下，假設解析度是 1 cm，LiDAR 掃完某區域後，得到七個點，這些點分別投影在平面後，屬於三個網格，接下來只要找每個網格單位內，LiDAR 掃到的點之最低 z 值，就是表面的高度了。將這些 z 值和網格座標彙整，利用 GIS 即可轉換成 raster 格式的 STM。
+
+![][min_values]
+
+[min_values]: find_minimum_values.png
+
+實際上，我們可以只針對 x, y 值去換算成網格的資料，若解析度為 1cm ，1cm 以下的小數位數則捨去不計。例如某一點 xy 座標為 (1.51, -0.53)，那轉換成 1cm 解析度網格的座標則是 (1, 0)。轉換成新的網格座標系統後，找出相同網格內的所有 z 值，求最小值則是該網格的地表高度。
+
+在我們上面的範例資料中，若用 0.1cm 解析度的網格計算，則可得下列表：
+
+id | x      | y      | z
+---|------- |--------|---------
+1  | -0.106 | -0.162 | 1178.482
+2  | -0.106 | -0.162 | 1178.475
+3  | -0.106 | -0.162 | 1178.474
+4  | -0.106 | -0.162 | 1178.481
+5  | -0.106 | -0.162 | 1178.473
+6  | -0.105 | -0.162 | 1178.472
+
+計算相同網格座標內的最小值，則會得到：
+
+id | x      | y      | z
+---|------- |--------|---------
+5  | -0.106 | -0.162 | 1178.473
+6  | -0.105 | -0.162 | 1178.472
+
+### R 實作
+
+0. 安裝套件
+
+必須安裝的套件(package): [raster](cran.r-project.org/web/packages/raster)
+選擇性安裝的套件：[rhdfs](https://github.com/RevolutionAnalytics/rhdfs)
+
+1. 先將資料匯入，可以使用 `read.csv()`。因為載入資料數量很大，下面例子採用 [RHadoop](https://github.com/RevolutionAnalytics/RHadoop/wiki) 為例，你可以依照需求修改：
+
+```
+Sys.setenv(HADOOP_CMD="/usr/local/bin/hadoop")
+
+library(rhdfs)
+library(rmr2)
+hdfs.init();
+
+# import data into hdfs via hdfs.file()
+HDFS_r = hdfs.file("ST000.xyz", "r",buffersize = 104857600)
+HDFS_f = hdfs.read(HDFS_F)
+data = read.csv(textConnection(rawToChar(HDFS_f)), sep=" ", header=F)
+```
+
+如果你不知道什麼是 Hadoop ，請跳過，可直接使用 `read.csv()` 來匯入資料
+```{r}
+data = read.csv('~/Documents/Dropbox/projects/LiDAR/lidar_process/sample_data.xyz',
+                header=F, sep=" ")
+# use head to view top six rows
+head(data)
+```
+
+上面的資料中，`V1` 至 `V4` 欄位分別代表相對座標 `(x, y, z)` (相對於 LiDAR 儀器擺放的中心)，以及反射強度值。
+
+
+2. 將 `(x, y)` 座標取出，用無條件捨去法處理
+
+接下來將 dataset 中的 x, y 座標取出來，並假設解析度為 10 cm。因為原始資料單位是公尺，為了方便計算，將其換算為公分後，再無條件捨去，在這個步驟中，我們會使用到 `trunc` 這個函式：
+
+```{r}
+trunc_xy = trunc(data[,1:2]*100/10)*10
+head(trunc_xy)
+```
+
+處理完之後，把四捨五入的 x 及 y 座標用 column bind (`cbind`) 合併在一起。
+```{r}
+trunc_xyz = cbind(trunc_xy, data[,3])
+
+# 為了讓 dataframe 美觀且容易閱讀，我們加上欄位名稱
+colnames(trunc_xyz) = c("x", "y", "z")
+head(trunc_xyz)
+```
+
+3. 使用 `aggregate` 求出相同網格(xy 座標)中的最小值
+
+這個步驟主要是把 `(x, y)` 合併當成一個群組，相當於 group by 的概念，在一個 group 中求出 z 的最小值。
+
+```{r}
+# aggregate(target, by=_grouping_elements, FUN=_function)
+aggr_xyz = stats::aggregate(trunc_xyz["z"], by=trunc_xyz[c("x", "y")], FUN=min)
+aggr_xyz
+```
+
+所以上面的 dataframe 就是我們所要求的 10cm 解析度的網格 xyz 座標值。
+
+4. 寫成函式
+
+整理一下上述步驟，將處理的程序寫成函式，方便後續的處理：
+
+輸入之變數： 資料集(dataframe)、網格解析度(res)
+使用的功能函式：`stats::aggregate()`, `base::trunc()`
+
+```{r}
+proc_stm = function(dataframe,res) {
+  r_cm = 100
+  trunc_xyz = cbind(trunc(dataframe[,1:2]*r_cm/res)*res, dataframe[,3])
+  colnames(trunc_xyz) = c("x", "y", "z")
+  output = aggregate(trunc_xyz["z"], by=trunc_xyz[c("x","y")], FUN=min)
+  return(output)
+}
+```
+
+處理 STM:
+
+```{r}
+output.xyz = proc_stm(data, 10)
+output.xyz
+```
+
+5. 將 xyz 座標轉換成 raster 網格
+
+因為 LiDAR 具有距離限制，我們希望以 LiDAR 架設點為原點， 30 公尺的正方形限定範圍：
+
+```{r}
+# limit the target area to 30 by 30 meters
+bound=15
+output_cm.xyz = output.xyz[(abs(output.xyz[,1]/100) < bound & abs(output.xyz[,2]/100) < bound),]
+#換算回公尺
+output_m.xyz = cbind(output_cm.xyz[,1:2]/100, output_cm.xyz[,3])
+output_m.xyz
+```
+
+接下來使用 `rasterFromXYZ()` 將 xyz 座標轉成 raster 格式，並使用 `writeRaster()` 輸出為 GeoTiff raster 格式：
+
+```{r}
+# use raster library to output raster file
+library(raster)
+rast = rasterFromXYZ(output_m.xyz)
+writeRaster(rast, filename = 'output.tif', overwrite=TRUE)
+```
+
+下圖則是輸出的範例（非本例中之資料輸出）
+![][lidar_stm]
+
+[lidar_stm]: lidar_stm.png
+
+
+
+
